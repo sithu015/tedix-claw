@@ -1,0 +1,515 @@
+/**
+ * OpenClaw + Cloudflare Sandbox
+ *
+ * This Worker runs OpenClaw personal AI assistant in a Cloudflare Sandbox container.
+ * It proxies all requests to the OpenClaw Gateway's web UI and WebSocket endpoint.
+ *
+ * Features:
+ * - Web UI (Control Dashboard + WebChat) at /
+ * - WebSocket support for real-time communication
+ * - Admin UI at /_admin/ for device management
+ * - Configuration via environment secrets
+ *
+ * Required secrets (set via `wrangler secret put`):
+ * - ANTHROPIC_API_KEY: Your Anthropic API key
+ *
+ * Optional secrets:
+ * - OPENCLAW_GATEWAY_TOKEN: Token to protect gateway access
+ * - TELEGRAM_BOT_TOKEN: Telegram bot token
+ * - DISCORD_BOT_TOKEN: Discord bot token
+ * - SLACK_BOT_TOKEN + SLACK_APP_TOKEN: Slack tokens
+ */
+
+import { getSandbox, Sandbox, type SandboxOptions } from "@cloudflare/sandbox";
+import { Hono } from "hono";
+import configErrorHtml from "./assets/config-error.html";
+import loadingPageHtml from "./assets/loading.html";
+import { createAccessMiddleware } from "./auth";
+import { GATEWAY_PORT } from "./config";
+import { ensureGateway, findExistingGateway, syncToR2 } from "./gateway";
+import { adminUi, api, cdp, debug, publicRoutes } from "./routes";
+import type { AppEnv, OpenClawEnv } from "./types";
+import { redactSensitiveParams } from "./utils/logging";
+
+/**
+ * Transform error messages from the gateway to be more user-friendly.
+ */
+function transformErrorMessage(message: string, host: string): string {
+  if (message.includes("gateway token missing") || message.includes("gateway token mismatch")) {
+    return `Invalid or missing token. Visit https://${host}?token={REPLACE_WITH_YOUR_TOKEN}`;
+  }
+
+  if (message.includes("pairing required")) {
+    return `Pairing required. Visit https://${host}/_admin/`;
+  }
+
+  return message;
+}
+
+export { Sandbox };
+
+/**
+ * Validate required environment variables.
+ * Returns an array of missing variable descriptions, or empty array if all are set.
+ */
+function validateRequiredEnv(env: OpenClawEnv): string[] {
+  const missing: string[] = [];
+  const isTestMode = env.DEV_MODE === "true" || env.E2E_TEST_MODE === "true";
+
+  if (!env.OPENCLAW_GATEWAY_TOKEN) {
+    missing.push("OPENCLAW_GATEWAY_TOKEN");
+  }
+
+  // CF Access vars not required in dev/test mode since auth is skipped
+  if (!isTestMode) {
+    if (!env.CF_ACCESS_TEAM_DOMAIN) {
+      missing.push("CF_ACCESS_TEAM_DOMAIN");
+    }
+
+    if (!env.CF_ACCESS_AUD) {
+      missing.push("CF_ACCESS_AUD");
+    }
+  }
+
+  // Check for AI provider configuration (at least one must be set)
+  // CLAUDE_SETUP_TOKEN also counts — it provides Anthropic auth via auth-profiles.json
+  const hasCloudflareGateway = !!(
+    env.CLOUDFLARE_AI_GATEWAY_API_KEY &&
+    env.CF_AI_GATEWAY_ACCOUNT_ID &&
+    env.CF_AI_GATEWAY_GATEWAY_ID
+  );
+  const hasLegacyGateway = !!(env.AI_GATEWAY_API_KEY && env.AI_GATEWAY_BASE_URL);
+  const hasAnthropicKey = !!env.ANTHROPIC_API_KEY;
+  const hasOpenAIKey = !!env.OPENAI_API_KEY;
+  const hasSetupToken = !!env.CLAUDE_SETUP_TOKEN;
+
+  if (
+    !hasCloudflareGateway &&
+    !hasLegacyGateway &&
+    !hasAnthropicKey &&
+    !hasOpenAIKey &&
+    !hasSetupToken
+  ) {
+    missing.push(
+      "ANTHROPIC_API_KEY, OPENAI_API_KEY, CLAUDE_SETUP_TOKEN, or CLOUDFLARE_AI_GATEWAY_API_KEY + CF_AI_GATEWAY_ACCOUNT_ID + CF_AI_GATEWAY_GATEWAY_ID",
+    );
+  }
+
+  return missing;
+}
+
+/**
+ * Build sandbox options based on environment configuration.
+ *
+ * SANDBOX_SLEEP_AFTER controls how long the container stays alive after inactivity:
+ * - 'never' (default): Container stays alive indefinitely (recommended due to long cold starts)
+ * - Duration string: e.g., '10m', '1h', '30s' - container sleeps after this period of inactivity
+ *
+ * To reduce costs at the expense of cold start latency, set SANDBOX_SLEEP_AFTER to a duration:
+ *   npx wrangler secret put SANDBOX_SLEEP_AFTER
+ *   # Enter: 10m (or 1h, 30m, etc.)
+ */
+function buildSandboxOptions(env: OpenClawEnv): SandboxOptions {
+  const sleepAfter = env.SANDBOX_SLEEP_AFTER?.toLowerCase() || "never";
+
+  // 'never' means keep the container alive indefinitely
+  if (sleepAfter === "never") {
+    return { keepAlive: true };
+  }
+
+  // Otherwise, use the specified duration
+  return { sleepAfter };
+}
+
+// Main app
+const app = new Hono<AppEnv>();
+
+// =============================================================================
+// MIDDLEWARE: Applied to ALL routes
+// =============================================================================
+
+// Middleware: Log every request
+app.use("*", async (c, next) => {
+  const url = new URL(c.req.url);
+  const redactedSearch = redactSensitiveParams(url);
+  console.log(`[REQ] ${c.req.method} ${url.pathname}${redactedSearch}`);
+  console.log(`[REQ] Has ANTHROPIC_API_KEY: ${!!c.env.ANTHROPIC_API_KEY}`);
+  console.log(`[REQ] DEV_MODE: ${c.env.DEV_MODE}`);
+  console.log(`[REQ] DEBUG_ROUTES: ${c.env.DEBUG_ROUTES}`);
+  await next();
+});
+
+// Middleware: Initialize sandbox for all requests
+app.use("*", async (c, next) => {
+  const options = buildSandboxOptions(c.env);
+  const sandbox = getSandbox(c.env.Sandbox, "openclaw", options);
+  c.set("sandbox", sandbox);
+  await next();
+});
+
+// =============================================================================
+// PUBLIC ROUTES: No Cloudflare Access authentication required
+// =============================================================================
+
+// Mount public routes first (before auth middleware)
+// Includes: /sandbox-health, /logo.png, /logo-small.png, /api/status, /_admin/assets/*
+app.route("/", publicRoutes);
+
+// Mount CDP routes (uses shared secret auth via query param, not CF Access)
+app.route("/cdp", cdp);
+
+// =============================================================================
+// PROTECTED ROUTES: Cloudflare Access authentication required
+// =============================================================================
+
+// Middleware: Validate required environment variables (skip in dev mode and for debug routes)
+app.use("*", async (c, next) => {
+  const url = new URL(c.req.url);
+
+  // Skip validation for debug routes (they have their own enable check)
+  if (url.pathname.startsWith("/debug")) {
+    return next();
+  }
+
+  // Skip validation in dev mode
+  if (c.env.DEV_MODE === "true") {
+    return next();
+  }
+
+  const missingVars = validateRequiredEnv(c.env);
+  if (missingVars.length > 0) {
+    console.error("[CONFIG] Missing required environment variables:", missingVars.join(", "));
+
+    const acceptsHtml = c.req.header("Accept")?.includes("text/html");
+    if (acceptsHtml) {
+      // Return a user-friendly HTML error page
+      const html = configErrorHtml.replace("{{MISSING_VARS}}", missingVars.join(", "));
+      return c.html(html, 503);
+    }
+
+    // Return JSON error for API requests
+    return c.json(
+      {
+        error: "Configuration error",
+        message: "Required environment variables are not configured",
+        missing: missingVars,
+        hint: "Set these using: wrangler secret put <VARIABLE_NAME>",
+      },
+      503,
+    );
+  }
+
+  return next();
+});
+
+// Middleware: Cloudflare Access authentication for protected routes
+app.use("*", async (c, next) => {
+  // Determine response type based on Accept header
+  const acceptsHtml = c.req.header("Accept")?.includes("text/html");
+  const middleware = createAccessMiddleware({
+    type: acceptsHtml ? "html" : "json",
+    redirectOnMissing: acceptsHtml,
+  });
+
+  return middleware(c, next);
+});
+
+// Mount API routes (protected by Cloudflare Access)
+app.route("/api", api);
+
+// Mount Admin UI routes (protected by Cloudflare Access)
+app.route("/_admin", adminUi);
+
+// Mount debug routes (protected by Cloudflare Access, only when DEBUG_ROUTES is enabled)
+app.use("/debug/*", async (c, next) => {
+  if (c.env.DEBUG_ROUTES !== "true") {
+    return c.json({ error: "Debug routes are disabled" }, 404);
+  }
+  return next();
+});
+app.route("/debug", debug);
+
+// =============================================================================
+// CATCH-ALL: Proxy to OpenClaw gateway
+// =============================================================================
+
+app.all("*", async (c) => {
+  const sandbox = c.get("sandbox");
+  const request = c.req.raw;
+  const url = new URL(request.url);
+
+  console.log("[PROXY] Handling request:", url.pathname);
+
+  // Check if gateway is already running
+  const existingProcess = await findExistingGateway(sandbox);
+  const isGatewayReady = existingProcess !== null && existingProcess.status === "running";
+
+  // For browser requests (non-WebSocket, non-API), show loading page if gateway isn't ready
+  const isWebSocketRequest = request.headers.get("Upgrade")?.toLowerCase() === "websocket";
+  const acceptsHtml = request.headers.get("Accept")?.includes("text/html");
+
+  if (!isGatewayReady && !isWebSocketRequest && acceptsHtml) {
+    console.log("[PROXY] Gateway not ready, serving loading page");
+
+    // Start the gateway in the background (don't await)
+    c.executionCtx.waitUntil(
+      ensureGateway(sandbox, c.env).catch((err: Error) => {
+        console.error("[PROXY] Background gateway start failed:", err);
+      }),
+    );
+
+    // Return the loading page immediately
+    return c.html(loadingPageHtml);
+  }
+
+  // Ensure openclaw is running (this will wait for startup)
+  try {
+    await ensureGateway(sandbox, c.env);
+  } catch (error) {
+    console.error("[PROXY] Failed to start OpenClaw:", error);
+    const errorMessage = error instanceof Error ? error.message : "Unknown error";
+
+    let hint = "Check worker logs with: wrangler tail";
+    const hasAnyAuth =
+      c.env.ANTHROPIC_API_KEY ||
+      c.env.OPENAI_API_KEY ||
+      c.env.CLAUDE_SETUP_TOKEN ||
+      c.env.CLOUDFLARE_AI_GATEWAY_API_KEY;
+    if (!hasAnyAuth) {
+      hint =
+        "No AI provider key is set. Run: wrangler secret put ANTHROPIC_API_KEY (or set CLAUDE_SETUP_TOKEN)";
+    } else if (errorMessage.includes("reset because its code was updated")) {
+      hint =
+        "Container was reset by a Worker deploy. Refresh the page — it should recover in 1-2 minutes.";
+    } else if (errorMessage.includes("heap out of memory") || errorMessage.includes("OOM")) {
+      hint = "Gateway ran out of memory. Try again or check for memory leaks.";
+    }
+
+    return c.json(
+      {
+        error: "OpenClaw gateway failed to start",
+        details: errorMessage,
+        hint,
+      },
+      503,
+    );
+  }
+
+  // Proxy to OpenClaw with WebSocket message interception
+  if (isWebSocketRequest) {
+    const debugLogs = c.env.DEBUG_ROUTES === "true";
+    const redactedSearch = redactSensitiveParams(url);
+
+    console.log("[WS] Proxying WebSocket connection to OpenClaw");
+    if (debugLogs) {
+      console.log("[WS] URL:", url.pathname + redactedSearch);
+    }
+
+    // Inject gateway token into WebSocket request if not already present.
+    // CF Access redirects strip query params, so authenticated users lose ?token=.
+    // Since the user already passed CF Access auth, we inject the token server-side.
+    let wsRequest = request;
+    if (c.env.OPENCLAW_GATEWAY_TOKEN && !url.searchParams.has("token")) {
+      const tokenUrl = new URL(url.toString());
+      tokenUrl.searchParams.set("token", c.env.OPENCLAW_GATEWAY_TOKEN);
+      wsRequest = new Request(tokenUrl.toString(), request);
+    }
+
+    // Get WebSocket connection to the container
+    const containerResponse = await sandbox.wsConnect(wsRequest, GATEWAY_PORT);
+    console.log("[WS] wsConnect response status:", containerResponse.status);
+
+    // Get the container-side WebSocket
+    const containerWs = containerResponse.webSocket;
+    if (!containerWs) {
+      console.error("[WS] No WebSocket in container response - falling back to direct proxy");
+      return containerResponse;
+    }
+
+    if (debugLogs) {
+      console.log("[WS] Got container WebSocket, setting up interception");
+    }
+
+    // Create a WebSocket pair for the client
+    const [clientWs, serverWs] = Object.values(new WebSocketPair());
+
+    // Accept both WebSockets
+    serverWs.accept();
+    containerWs.accept();
+
+    if (debugLogs) {
+      console.log("[WS] Both WebSockets accepted");
+      console.log("[WS] containerWs.readyState:", containerWs.readyState);
+      console.log("[WS] serverWs.readyState:", serverWs.readyState);
+    }
+
+    // Relay messages from client to container
+    serverWs.addEventListener("message", (event) => {
+      if (debugLogs) {
+        console.log(
+          "[WS] Client -> Container:",
+          typeof event.data,
+          typeof event.data === "string" ? event.data.slice(0, 200) : "(binary)",
+        );
+      }
+      if (containerWs.readyState === WebSocket.OPEN) {
+        containerWs.send(event.data);
+      } else if (debugLogs) {
+        console.log("[WS] Container not open, readyState:", containerWs.readyState);
+      }
+    });
+
+    // Relay messages from container to client, with error transformation
+    containerWs.addEventListener("message", (event) => {
+      if (debugLogs) {
+        console.log(
+          "[WS] Container -> Client (raw):",
+          typeof event.data,
+          typeof event.data === "string" ? event.data.slice(0, 500) : "(binary)",
+        );
+      }
+      let data = event.data;
+
+      // Try to intercept and transform error messages
+      if (typeof data === "string") {
+        try {
+          const parsed = JSON.parse(data);
+          if (debugLogs) {
+            console.log("[WS] Parsed JSON, has error.message:", !!parsed.error?.message);
+          }
+          if (parsed.error?.message) {
+            if (debugLogs) {
+              console.log("[WS] Original error.message:", parsed.error.message);
+            }
+            parsed.error.message = transformErrorMessage(parsed.error.message, url.host);
+            if (debugLogs) {
+              console.log("[WS] Transformed error.message:", parsed.error.message);
+            }
+            data = JSON.stringify(parsed);
+          }
+        } catch (e) {
+          if (debugLogs) {
+            console.log("[WS] Not JSON or parse error:", e);
+          }
+        }
+      }
+
+      if (serverWs.readyState === WebSocket.OPEN) {
+        serverWs.send(data);
+      } else if (debugLogs) {
+        console.log("[WS] Server not open, readyState:", serverWs.readyState);
+      }
+    });
+
+    // Handle close events
+    serverWs.addEventListener("close", (event) => {
+      if (debugLogs) {
+        console.log("[WS] Client closed:", event.code, event.reason);
+      }
+      containerWs.close(event.code, event.reason);
+    });
+
+    containerWs.addEventListener("close", (event) => {
+      if (debugLogs) {
+        console.log("[WS] Container closed:", event.code, event.reason);
+      }
+      // Transform the close reason (truncate to 123 bytes max for WebSocket spec)
+      let reason = transformErrorMessage(event.reason, url.host);
+      if (reason.length > 123) {
+        reason = `${reason.slice(0, 120)}...`;
+      }
+      if (debugLogs) {
+        console.log("[WS] Transformed close reason:", reason);
+      }
+      serverWs.close(event.code, reason);
+    });
+
+    // Handle errors
+    serverWs.addEventListener("error", (event) => {
+      console.error("[WS] Client error:", event);
+      containerWs.close(1011, "Client error");
+    });
+
+    containerWs.addEventListener("error", (event) => {
+      console.error("[WS] Container error:", event);
+      serverWs.close(1011, "Container error");
+    });
+
+    if (debugLogs) {
+      console.log("[WS] Returning intercepted WebSocket response");
+    }
+    return new Response(null, {
+      status: 101,
+      webSocket: clientWs,
+    });
+  }
+
+  // Inject gateway token for HTTP requests (same as WebSocket injection above).
+  // The gateway's HTTP API (e.g., /v1/chat/completions) expects Authorization: Bearer.
+  // The SPA/WebSocket uses ?token= query param. We inject both for compatibility.
+  let httpRequest = request;
+  if (c.env.OPENCLAW_GATEWAY_TOKEN) {
+    const headers = new Headers(request.headers);
+    if (!headers.has("Authorization")) {
+      headers.set("Authorization", `Bearer ${c.env.OPENCLAW_GATEWAY_TOKEN}`);
+    }
+    const tokenUrl = new URL(url.toString());
+    if (!tokenUrl.searchParams.has("token")) {
+      tokenUrl.searchParams.set("token", c.env.OPENCLAW_GATEWAY_TOKEN);
+    }
+    httpRequest = new Request(tokenUrl.toString(), {
+      method: request.method,
+      headers,
+      body: request.body,
+      redirect: request.redirect,
+    });
+  }
+
+  console.log("[HTTP] Proxying:", url.pathname + url.search);
+  const httpResponse = await sandbox.containerFetch(httpRequest, GATEWAY_PORT);
+  console.log("[HTTP] Response status:", httpResponse.status);
+
+  // Add debug header to verify worker handled the request
+  const newHeaders = new Headers(httpResponse.headers);
+  newHeaders.set("X-Worker-Debug", "proxy-to-openclaw");
+  newHeaders.set("X-Debug-Path", url.pathname);
+
+  return new Response(httpResponse.body, {
+    status: httpResponse.status,
+    statusText: httpResponse.statusText,
+    headers: newHeaders,
+  });
+});
+
+/**
+ * Scheduled handler for cron triggers.
+ * Syncs openclaw config/state from container to R2 for persistence.
+ */
+async function scheduled(
+  _event: ScheduledEvent,
+  env: OpenClawEnv,
+  _ctx: ExecutionContext,
+): Promise<void> {
+  const options = buildSandboxOptions(env);
+  const sandbox = getSandbox(env.Sandbox, "openclaw", options);
+
+  const gatewayProcess = await findExistingGateway(sandbox);
+  if (!gatewayProcess) {
+    console.log("[cron] Gateway not running yet, skipping sync");
+    return;
+  }
+
+  console.log("[cron] Starting backup sync to R2...");
+  const result = await syncToR2(sandbox, env);
+
+  if (result.success) {
+    console.log("[cron] Backup sync completed successfully at", result.lastSync);
+  } else {
+    console.error("[cron] Backup sync failed:", result.error, result.details || "");
+  }
+}
+
+export default {
+  fetch: app.fetch,
+  scheduled,
+};

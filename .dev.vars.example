@@ -1,0 +1,49 @@
+# Copy this to .dev.vars and fill in your values
+# .dev.vars is gitignored and used by wrangler dev
+
+# ─── AI Provider (at least one required) ───────────────────────────
+# ANTHROPIC_API_KEY=sk-ant-...
+# OPENAI_API_KEY=sk-...
+
+# Cloudflare AI Gateway (alternative to direct provider keys)
+# CLOUDFLARE_AI_GATEWAY_API_KEY=your-provider-api-key
+# CF_AI_GATEWAY_ACCOUNT_ID=your-account-id
+# CF_AI_GATEWAY_GATEWAY_ID=your-gateway-id
+# CF_AI_GATEWAY_MODEL=workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast
+
+# ─── Development mode ──────────────────────────────────────────────
+# Skips CF Access auth and bypasses device pairing
+DEV_MODE=true
+
+# Enable debug routes at /debug/*
+DEBUG_ROUTES=true
+
+# ─── Auth tokens ─────────────────────────────────────────────────
+# Fixed gateway token for dev (in prod, use wrangler secret put)
+OPENCLAW_GATEWAY_TOKEN=dev-token-change-in-prod
+
+# Setup token from 'claude setup-token' — persists across container restarts
+# so you don't need to re-enter it every time via the admin UI.
+# CLAUDE_SETUP_TOKEN=your-setup-token
+
+# ─── Cloudflare Access (production only) ───────────────────────────
+# CF_ACCESS_TEAM_DOMAIN=myteam.cloudflareaccess.com
+# CF_ACCESS_AUD=your-application-audience-tag
+
+# ─── R2 persistent storage ─────────────────────────────────────────
+# Required for persistence across container restarts
+# R2_ACCESS_KEY_ID=your-r2-key-id
+# R2_SECRET_ACCESS_KEY=your-r2-secret
+# CF_ACCOUNT_ID=your-cloudflare-account-id
+
+# ─── Chat channels (optional) ──────────────────────────────────────
+# Env vars set the token/enabled state; other channel settings
+# (allowFrom, group config) are preserved from R2 restore.
+# TELEGRAM_BOT_TOKEN=your-bot-token
+# TELEGRAM_DM_POLICY=pairing
+# DISCORD_BOT_TOKEN=your-bot-token
+# DISCORD_DM_POLICY=pairing
+
+# ─── Browser automation (optional) ─────────────────────────────────
+# CDP_SECRET=shared-secret-for-cdp-auth
+# WORKER_URL=https://your-worker.example.com
